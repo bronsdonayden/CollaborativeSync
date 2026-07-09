@@ -52,7 +52,9 @@
     let applyingRemote = false
     let pendingCandidates = []
     let remoteDescSet = false
-    let rafPending = false
+
+    // last known crosshair position used by the raf sync loop to detect changes
+    let lastPos = Array.from(nv.scene.crosshairPos)
 
     onBaseVolumeChanged(nv, async (baseVolume) => {
       myVolumeHash = await hashVolume(baseVolume)
@@ -84,6 +86,27 @@
       }
     }
 
+    // chain onto existing handler so nothing downstream breaks
+    const prevHandler = nv.onLocationChange
+    nv.onLocationChange = function (loc) {
+      if (prevHandler) prevHandler(loc)
+    }
+
+    // poll crosshairPos every frame and send when it changes
+    // this catches scroll drag click and any other code path that moves the crosshair
+    // without us needing to know which niivue internal fired
+    function syncLoop() {
+      if (!applyingRemote && verified && dataChannel && dataChannel.readyState === 'open') {
+        const cur = nv.scene.crosshairPos
+        if (cur[0] !== lastPos[0] || cur[1] !== lastPos[1] || cur[2] !== lastPos[2]) {
+          lastPos = [cur[0], cur[1], cur[2]]
+          dataChannel.send(JSON.stringify({ type: 'crosshair', crosshairPos: lastPos }))
+        }
+      }
+      requestAnimationFrame(syncLoop)
+    }
+    requestAnimationFrame(syncLoop)
+
     signal.onopen = () => {
       signal.send(JSON.stringify({ type: 'join', room: roomId }))
     }
@@ -97,7 +120,6 @@
 
       if (type === 'peer-joined') {
         peerConn = createPeerConnection()
-        // unordered and unreliable so fast drags dont queue stale positions behind a dropped packet
         dataChannel = peerConn.createDataChannel('crosshair-sync', { ordered: false, maxRetransmits: 0 })
         wireDataChannel(dataChannel)
         const offer = await peerConn.createOffer()
@@ -122,7 +144,7 @@
         await flushCandidates()
       }
 
-      // buffer candidates that arrive before remote desc is set
+      // buffer people that arrive before remote desc is set
       if (type === 'ice') {
         if (remoteDescSet) {
           await peerConn.addIceCandidate(payload)
@@ -143,8 +165,6 @@
       const pc = new RTCPeerConnection({
         iceServers: [
           { urls: 'stun:stun.l.google.com:19302' }
-          // WARNING add a TURN server before using on institutional or hospital networks
-          // stun alone fails silently on symmetric nat which is common on university wifi
         ]
       })
       pc.onicecandidate = e => {
@@ -255,6 +275,8 @@
       applyingRemote = true
       try {
         nv.scene.crosshairPos = new Float32Array(state.crosshairPos)
+        // update lastPos so the raf loop doesnt echo the remote update back
+        lastPos = Array.from(state.crosshairPos)
         nv.createOnLocationChange()
         nv.drawScene()
       } finally {
@@ -270,24 +292,6 @@
       } finally {
         applyingRemote = false
       }
-    }
-
-    // chain onto existing handler, never replace it
-    const prevHandler = nv.onLocationChange
-    nv.onLocationChange = function (loc) {
-      if (prevHandler) prevHandler(loc)
-      if (applyingRemote) return
-      if (!verified || !dataChannel || dataChannel.readyState !== 'open') return
-      if (rafPending) return
-      rafPending = true
-      requestAnimationFrame(() => {
-        rafPending = false
-        if (dataChannel.readyState !== 'open') return
-        dataChannel.send(JSON.stringify({
-          type: 'crosshair',
-          crosshairPos: Array.from(nv.scene.crosshairPos)
-        }))
-      })
     }
   }
 
